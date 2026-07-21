@@ -1,0 +1,71 @@
+import admin from 'firebase-admin';
+
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert({
+      projectId: process.env.FIREBASE_PROJECT_ID,
+      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+      privateKey: (process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n'),
+    }),
+  });
+}
+
+const db = admin.firestore();
+
+export default async function handler(req, res) {
+  try {
+    const snap = await db.collectionGroup('cartLeads')
+      .where('recoveryEmailSent', '==', false)
+      .where('converted', '==', false)
+      .get();
+
+    const now = Date.now();
+    let sent = 0;
+
+    for (const doc of snap.docs) {
+      const lead = doc.data();
+      const created = new Date(lead.createdAt).getTime();
+      const ageMs = now - created;
+
+      // Only email leads between 1 and 48 hours old - skips ones too fresh to call
+      // "abandoned" yet, and skips very stale ones that are unlikely to convert anyway
+      if (ageMs < 60 * 60 * 1000 || ageMs > 48 * 60 * 60 * 1000) continue;
+
+      const merchantRef = doc.ref.parent.parent;
+      const merchantSnap = await merchantRef.get();
+      const merchant = merchantSnap.data() || {};
+      const storeLink = merchant.storeSlug ? `https://salespilot.store/${merchant.storeSlug}` : '#';
+
+      const itemsHtml = (lead.items || []).map(it =>
+        `<li>${it.name} x${it.quantity} - ₦${(it.price * it.quantity).toLocaleString()}</li>`
+      ).join('');
+
+      const html = `
+        <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;color:#111827;">
+          <h2>You left something in your cart!</h2>
+          <p style="color:#6B7280;">${merchant.storeName || 'Your favorite store'} still has these waiting for you:</p>
+          <ul>${itemsHtml}</ul>
+          <p style="font-size:16px;font-weight:bold;">Total: ₦${(lead.cartTotal || 0).toLocaleString()}</p>
+          <a href="${storeLink}" style="display:inline-block;background:#142A45;color:#fff;padding:12px 22px;border-radius:10px;text-decoration:none;margin-top:10px;font-weight:bold;">Complete Your Order</a>
+        </div>
+      `;
+
+      try {
+        await fetch('https://api.resend.com/emails', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ from: 'SalesPilot Store <onboarding@resend.dev>', to: [lead.email], subject: 'You left something in your cart!', html }),
+        });
+        await doc.ref.update({ recoveryEmailSent: true });
+        sent++;
+      } catch (err) {
+        console.error('Failed to send recovery email to', lead.email, err);
+      }
+    }
+
+    return res.status(200).json({ checked: snap.size, sent });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Failed to check abandoned carts' });
+  }
+}
